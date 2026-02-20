@@ -106,3 +106,28 @@ This is a conservative estimate; actual peak may be lower due to buffer reuse.
 ```bash
 ./bin/simple-profiler
 ```
+
+## Benchmark Overhead
+
+To measure profiler overhead (disabled vs enabled):
+
+```bash
+./bin/bench-profiler-overhead [n_elements] [n_iterations]
+```
+
+- **n_elements**: Graph size (default 512). Larger graphs amortize timing overhead.
+- **n_iterations**: Number of runs (default 100).
+
+Example output:
+
+```
+=== Profiler overhead benchmark ===
+Graph: n=512 elements (mul + add), 100 iterations (+ 5 warmup)
+
+Profiler disabled: 1234 us total, 12.340 us/iter (avg)
+Profiler enabled:  1250 us total, 12.500 us/iter (avg)
+
+Overhead: 0.160 us/iter (1.30%)
+```
+
+
