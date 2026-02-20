@@ -13,6 +13,7 @@
 #include "vec.h"
 #include "ops.h"
 #include "ggml.h"
+#include "ggml-profiler.h"
 #include "common.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
@@ -2965,7 +2966,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        uint64_t t0 = 0;
+        if (cplan->profiler && state->ith == 0) {
+            t0 = ggml_profiler_time_ns();
+        }
         ggml_compute_forward(&params, node);
+        if (cplan->profiler && state->ith == 0) {
+            ggml_profiler_record_op(cplan->profiler, node->op, ggml_profiler_time_ns() - t0);
+        }
 
         if (state->ith == 0 && cplan->abort_callback &&
                 cplan->abort_callback(cplan->abort_callback_data)) {
@@ -3211,6 +3219,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     GGML_ASSERT(cplan->n_threads > 0);
     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
 
+    uint64_t t_start = 0;
+    if (cplan->profiler) {
+        ggml_profiler_begin_graph(cplan->profiler, cgraph, cplan);
+        t_start = ggml_profiler_time_ns();
+    }
+
     int n_threads                               = cplan->n_threads;
     struct ggml_threadpool * threadpool = cplan->threadpool;
 
@@ -3271,6 +3285,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // don't leave affinity set on the main thread
     clear_numa_thread_affinity();
+
+    if (cplan->profiler) {
+        ggml_profiler_end_graph(cplan->profiler, ggml_profiler_time_ns() - t_start);
+    }
 
     enum ggml_status ret = threadpool->ec;
 

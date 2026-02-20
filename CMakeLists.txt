@@ -313,6 +313,7 @@ include(CMakePackageConfigHelpers)
 set(GGML_PUBLIC_HEADERS
     include/ggml.h
     include/ggml-cpu.h
+    include/ggml-profiler.h
     include/ggml-alloc.h
     include/ggml-backend.h
     include/ggml-blas.h
