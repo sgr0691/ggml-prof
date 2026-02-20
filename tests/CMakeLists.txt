@@ -272,6 +272,12 @@ if (NOT GGML_BACKEND_DL)
     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
 
     #
+    # bench-profiler-overhead
+
+    add_executable(bench-profiler-overhead bench-profiler-overhead.c)
+    target_link_libraries(bench-profiler-overhead PRIVATE ggml)
+
+    #
     # test-dup
 
     set(TEST_TARGET test-dup)
