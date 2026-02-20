@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 
+    struct ggml_profiler;
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {
@@ -22,6 +24,9 @@ extern "C" {
 
         // use only reference implementations
         bool use_ref;
+
+        // optional profiler (ggml_profiler_t *) for op-level timing and memory stats
+        struct ggml_profiler * profiler;
     };
 
     // numa strategies
