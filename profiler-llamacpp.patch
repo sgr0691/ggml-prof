@@ -1,0 +1,985 @@
+diff --git a/ggml/CMakeLists.txt b/ggml/CMakeLists.txt
+index 4323afe..c0ec2e2 100644
+--- a/ggml/CMakeLists.txt
++++ b/ggml/CMakeLists.txt
+@@ -313,6 +313,7 @@ include(CMakePackageConfigHelpers)
+ set(GGML_PUBLIC_HEADERS
+     include/ggml.h
+     include/ggml-cpu.h
++    include/ggml-profiler.h
+     include/ggml-alloc.h
+     include/ggml-backend.h
+     include/ggml-blas.h
+diff --git a/ggml/include/ggml-cpu.h b/ggml/include/ggml-cpu.h
+index e3e067c..7e4abba 100644
+--- a/ggml/include/ggml-cpu.h
++++ b/ggml/include/ggml-cpu.h
+@@ -7,6 +7,8 @@
+ extern "C" {
+ #endif
+ 
++    struct ggml_profiler;
++
+     // the compute plan that needs to be prepared for ggml_graph_compute()
+     // since https://github.com/ggml-org/ggml/issues/287
+     struct ggml_cplan {
+@@ -22,6 +24,9 @@ extern "C" {
+ 
+         // use only reference implementations
+         bool use_ref;
++
++        // optional profiler (ggml_profiler_t *) for op-level timing and memory stats
++        struct ggml_profiler * profiler;
+     };
+ 
+     // numa strategies
+diff --git a/ggml/include/ggml-profiler.h b/ggml/include/ggml-profiler.h
+new file mode 100644
+index 0000000..f6350a4
+--- /dev/null
++++ b/ggml/include/ggml-profiler.h
+@@ -0,0 +1,78 @@
++#pragma once
++
++//
++// GGML Graph Profiler
++//
++// Opt-in profiling facility for ggml_graph_compute:
++// - per-op wall time (and count)
++// - graph-level totals (wall time, n_ops, n_threads)
++// - peak memory estimate (work buffer + unique backend buffers)
++// - JSON and human-readable table export
++//
++// Zero overhead when profiler is not attached.
++//
++
++#include <stdint.h>
++#include <stddef.h>
++#include <stdio.h>
++#include "ggml.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#ifndef GGML_API
++#define GGML_API
++#endif
++
++typedef struct ggml_profiler ggml_profiler_t;
++
++// A single aggregated op record (by op type)
++struct ggml_profiler_op_stat {
++    enum ggml_op op;
++    uint64_t count;
++    double   wall_ms_total;
++    double   wall_ms_max;
++};
++
++// Graph summary
++struct ggml_profiler_summary {
++    double   wall_ms_total;
++    int      n_threads;
++    int      n_nodes_executed;
++    size_t   work_size_bytes;
++    size_t   buffers_size_bytes;      // sum unique backend buffers
++    size_t   peak_estimate_bytes;     // work + buffers
++};
++
++// Lifecycle
++GGML_API ggml_profiler_t * ggml_profiler_new(void);
++GGML_API void              ggml_profiler_free(ggml_profiler_t * p);
++GGML_API void              ggml_profiler_reset(ggml_profiler_t * p);
++
++// Attach/detach profiler to a compute plan (lowest friction)
++GGML_API void ggml_cplan_set_profiler(struct ggml_cplan * cplan, ggml_profiler_t * p);
++
++// Read results
++GGML_API void ggml_profiler_get_summary(const ggml_profiler_t * p, struct ggml_profiler_summary * out);
++
++// Export
++GGML_API void ggml_profiler_dump_json(const ggml_profiler_t * p, FILE * fp);
++GGML_API void ggml_profiler_dump_table(const ggml_profiler_t * p, FILE * fp, int top_k);
++
++// Internal: monotonic time in nanoseconds (for instrumentation)
++GGML_API uint64_t ggml_profiler_time_ns(void);
++
++// Internal: record op timing (called by CPU backend when ith == 0)
++GGML_API void ggml_profiler_record_op(ggml_profiler_t * p, enum ggml_op op, uint64_t wall_ns);
++
++// Internal: start/end graph timing, compute memory estimate (called by CPU backend)
++GGML_API void ggml_profiler_begin_graph(ggml_profiler_t * p, const struct ggml_cgraph * cgraph,
++                                        const struct ggml_cplan * cplan);
++GGML_API void ggml_profiler_end_graph(ggml_profiler_t * p, uint64_t wall_ns_total);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/ggml/src/CMakeLists.txt b/ggml/src/CMakeLists.txt
+index 2650237..8ed51a6 100644
+--- a/ggml/src/CMakeLists.txt
++++ b/ggml/src/CMakeLists.txt
+@@ -195,12 +195,14 @@ add_library(ggml-base
+             ../include/ggml-backend.h
+             ../include/ggml-cpp.h
+             ../include/ggml-opt.h
++            ../include/ggml-profiler.h
+             ../include/gguf.h
+             ggml.c
+             ggml.cpp
+             ggml-alloc.c
+             ggml-backend.cpp
+             ggml-opt.cpp
++            ggml-profiler.c
+             ggml-threading.cpp
+             ggml-threading.h
+             ggml-quants.c
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index e048d5e..33442c3 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -13,6 +13,7 @@
+ #include "vec.h"
+ #include "ops.h"
+ #include "ggml.h"
++#include "ggml-profiler.h"
+ #include "common.h"
+ 
+ #if defined(_MSC_VER) || defined(__MINGW32__)
+@@ -2965,7 +2966,14 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
+             continue;
+         }
+ 
++        uint64_t t0 = 0;
++        if (cplan->profiler && state->ith == 0) {
++            t0 = ggml_profiler_time_ns();
++        }
+         ggml_compute_forward(&params, node);
++        if (cplan->profiler && state->ith == 0) {
++            ggml_profiler_record_op(cplan->profiler, node->op, ggml_profiler_time_ns() - t0);
++        }
+ 
+         if (state->ith == 0 && cplan->abort_callback &&
+                 cplan->abort_callback(cplan->abort_callback_data)) {
+@@ -3211,6 +3219,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     GGML_ASSERT(cplan->n_threads > 0);
+     GGML_ASSERT(cplan->work_size == 0 || cplan->work_data != NULL);
+ 
++    uint64_t t_start = 0;
++    if (cplan->profiler) {
++        ggml_profiler_begin_graph(cplan->profiler, cgraph, cplan);
++        t_start = ggml_profiler_time_ns();
++    }
++
+     int n_threads                               = cplan->n_threads;
+     struct ggml_threadpool * threadpool = cplan->threadpool;
+ 
+@@ -3272,6 +3286,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
+     // don't leave affinity set on the main thread
+     clear_numa_thread_affinity();
+ 
++    if (cplan->profiler) {
++        ggml_profiler_end_graph(cplan->profiler, ggml_profiler_time_ns() - t_start);
++    }
++
+     enum ggml_status ret = threadpool->ec;
+ 
+     if (disposable_threadpool) {
+diff --git a/ggml/src/ggml-profiler.c b/ggml/src/ggml-profiler.c
+new file mode 100644
+index 0000000..c47a2f4
+--- /dev/null
++++ b/ggml/src/ggml-profiler.c
+@@ -0,0 +1,227 @@
++//
++// GGML Graph Profiler - per-op timing, memory estimate, JSON/table export
++//
++
++#include "ggml-profiler.h"
++#include "ggml.h"
++#include "ggml-impl.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <inttypes.h>
++#include <time.h>
++
++#define GGML_PROFILER_OP_COUNT (GGML_OP_COUNT + 1)
++
++struct ggml_profiler {
++    // per-op stats: index by enum ggml_op (0..GGML_OP_COUNT-1)
++    uint64_t count[GGML_PROFILER_OP_COUNT];
++    uint64_t total_ns[GGML_PROFILER_OP_COUNT];
++    uint64_t max_ns[GGML_PROFILER_OP_COUNT];
++
++    // summary (filled at end_graph)
++    double   wall_ms_total;
++    int      n_threads;
++    int      n_nodes_executed;
++    size_t   work_size_bytes;
++    size_t   buffers_size_bytes;
++    size_t   peak_estimate_bytes;
++};
++
++#if defined(_WIN32) && (defined(_MSC_VER) || defined(__MINGW32__))
++#include <windows.h>
++#endif
++
++uint64_t ggml_profiler_time_ns(void) {
++#if defined(_WIN32) && (defined(_MSC_VER) || defined(__MINGW32__))
++    LARGE_INTEGER t, f;
++    QueryPerformanceCounter(&t);
++    QueryPerformanceFrequency(&f);
++    return (uint64_t)((t.QuadPart * 1000000000ULL) / f.QuadPart);
++#else
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
++#endif
++}
++
++ggml_profiler_t * ggml_profiler_new(void) {
++    ggml_profiler_t * p = (ggml_profiler_t *)malloc(sizeof(struct ggml_profiler));
++    if (p) {
++        ggml_profiler_reset(p);
++    }
++    return p;
++}
++
++void ggml_profiler_free(ggml_profiler_t * p) {
++    free(p);
++}
++
++void ggml_profiler_reset(ggml_profiler_t * p) {
++    if (!p) return;
++    memset(p->count, 0, sizeof(p->count));
++    memset(p->total_ns, 0, sizeof(p->total_ns));
++    memset(p->max_ns, 0, sizeof(p->max_ns));
++    p->wall_ms_total = 0;
++    p->n_threads = 0;
++    p->n_nodes_executed = 0;
++    p->work_size_bytes = 0;
++    p->buffers_size_bytes = 0;
++    p->peak_estimate_bytes = 0;
++}
++
++void ggml_cplan_set_profiler(struct ggml_cplan * cplan, ggml_profiler_t * p) {
++    if (cplan) {
++        cplan->profiler = p;
++    }
++}
++
++void ggml_profiler_record_op(ggml_profiler_t * p, enum ggml_op op, uint64_t wall_ns) {
++    if (!p || op >= GGML_OP_COUNT) return;
++    int idx = (int)op;
++    p->count[idx]++;
++    p->total_ns[idx] += wall_ns;
++    if (wall_ns > p->max_ns[idx]) {
++        p->max_ns[idx] = wall_ns;
++    }
++}
++
++static void add_buffer_unique(ggml_backend_buffer_t * bufs, int * n_bufs, int max_bufs, ggml_backend_buffer_t buf) {
++    if (!buf) return;
++    for (int i = 0; i < *n_bufs; i++) {
++        if (bufs[i] == buf) return;
++    }
++    if (*n_bufs < max_bufs) {
++        bufs[(*n_bufs)++] = buf;
++    }
++}
++
++static size_t ggml_profiler_compute_buffers_size(const struct ggml_cgraph * cgraph) {
++    // Collect unique backend buffers from nodes and leafs
++#define MAX_BUFFERS 4096
++    ggml_backend_buffer_t bufs[MAX_BUFFERS];
++    int n_bufs = 0;
++
++    for (int i = 0; i < cgraph->n_nodes; i++) {
++        struct ggml_tensor * t = cgraph->nodes[i];
++        if (t->buffer) add_buffer_unique(bufs, &n_bufs, MAX_BUFFERS, t->buffer);
++    }
++    for (int i = 0; i < cgraph->n_leafs; i++) {
++        struct ggml_tensor * t = cgraph->leafs[i];
++        if (t->buffer) add_buffer_unique(bufs, &n_bufs, MAX_BUFFERS, t->buffer);
++    }
++
++    size_t total = 0;
++    for (int i = 0; i < n_bufs; i++) {
++        total += ggml_backend_buffer_get_size(bufs[i]);
++    }
++    return total;
++}
++
++void ggml_profiler_begin_graph(ggml_profiler_t * p, const struct ggml_cgraph * cgraph,
++                               const struct ggml_cplan * cplan) {
++    if (!p || !cgraph || !cplan) return;
++    p->n_threads = cplan->n_threads;
++    p->work_size_bytes = cplan->work_size;
++    p->buffers_size_bytes = ggml_profiler_compute_buffers_size(cgraph);
++    p->peak_estimate_bytes = p->work_size_bytes + p->buffers_size_bytes;
++}
++
++void ggml_profiler_end_graph(ggml_profiler_t * p, uint64_t wall_ns_total) {
++    if (!p) return;
++    p->wall_ms_total = (double)wall_ns_total / 1e6;
++    int n_executed = 0;
++    for (int i = 0; i < GGML_PROFILER_OP_COUNT; i++) {
++        n_executed += (int)p->count[i];
++    }
++    p->n_nodes_executed = n_executed;
++}
++
++void ggml_profiler_get_summary(const ggml_profiler_t * p, struct ggml_profiler_summary * out) {
++    if (!p || !out) return;
++    out->wall_ms_total = p->wall_ms_total;
++    out->n_threads = p->n_threads;
++    out->n_nodes_executed = p->n_nodes_executed;
++    out->work_size_bytes = p->work_size_bytes;
++    out->buffers_size_bytes = p->buffers_size_bytes;
++    out->peak_estimate_bytes = p->peak_estimate_bytes;
++}
++
++void ggml_profiler_dump_json(const ggml_profiler_t * p, FILE * fp) {
++    if (!p || !fp) return;
++    fprintf(fp, "{\n");
++    fprintf(fp, "  \"version\": 1,\n");
++    fprintf(fp, "  \"summary\": {\n");
++    fprintf(fp, "    \"wall_ms_total\": %.6f,\n", p->wall_ms_total);
++    fprintf(fp, "    \"n_threads\": %d,\n", p->n_threads);
++    fprintf(fp, "    \"n_nodes_executed\": %d,\n", p->n_nodes_executed);
++    fprintf(fp, "    \"work_size_bytes\": %zu,\n", (size_t)p->work_size_bytes);
++    fprintf(fp, "    \"buffers_size_bytes\": %zu,\n", (size_t)p->buffers_size_bytes);
++    fprintf(fp, "    \"peak_estimate_bytes\": %zu\n", (size_t)p->peak_estimate_bytes);
++    fprintf(fp, "  },\n");
++    fprintf(fp, "  \"ops\": [\n");
++    int first = 1;
++    for (int i = 0; i < GGML_OP_COUNT; i++) {
++        if (p->count[i] == 0) continue;
++        const char * op_name = ggml_op_name((enum ggml_op)i);
++        if (!op_name) op_name = "UNKNOWN";
++        if (!first) fprintf(fp, ",\n");
++        fprintf(fp, "    { \"op\": \"%s\", \"count\": %" PRIu64 ", \"wall_ms_total\": %.6f, \"wall_ms_max\": %.6f }",
++                op_name, p->count[i],
++                (double)p->total_ns[i] / 1e6,
++                (double)p->max_ns[i] / 1e6);
++        first = 0;
++    }
++    fprintf(fp, "\n  ]\n");
++    fprintf(fp, "}\n");
++}
++
++void ggml_profiler_dump_table(const ggml_profiler_t * p, FILE * fp, int top_k) {
++    if (!p || !fp) return;
++    if (top_k <= 0) top_k = 20;
++
++    // Build sorted list of (op_idx, total_ms) for top-k
++    struct { int op_idx; double total_ms; } rows[GGML_PROFILER_OP_COUNT];
++    int n_rows = 0;
++    for (int i = 0; i < GGML_OP_COUNT; i++) {
++        if (p->count[i] == 0) continue;
++        rows[n_rows].op_idx = i;
++        rows[n_rows].total_ms = (double)p->total_ns[i] / 1e6;
++        n_rows++;
++    }
++    // Simple sort by total_ms descending
++    for (int i = 0; i < n_rows - 1; i++) {
++        for (int j = i + 1; j < n_rows; j++) {
++            if (rows[j].total_ms > rows[i].total_ms) {
++                int tmp_idx = rows[i].op_idx;
++                double tmp_ms = rows[i].total_ms;
++                rows[i].op_idx = rows[j].op_idx;
++                rows[i].total_ms = rows[j].total_ms;
++                rows[j].op_idx = tmp_idx;
++                rows[j].total_ms = tmp_ms;
++            }
++        }
++    }
++
++    fprintf(fp, "=== GGML Profiler Summary ===\n");
++    fprintf(fp, "Total wall time: %.3f ms\n", p->wall_ms_total);
++    fprintf(fp, "Threads: %d | Nodes executed: %d\n", p->n_threads, p->n_nodes_executed);
++    fprintf(fp, "Work buffer: %zu B | Backend buffers: %zu B | Peak estimate: %zu B\n",
++            (size_t)p->work_size_bytes, (size_t)p->buffers_size_bytes, (size_t)p->peak_estimate_bytes);
++    fprintf(fp, "\n--- Top %d ops by time ---\n", top_k);
++    fprintf(fp, "%-16s %8s %12s %12s\n", "OP", "COUNT", "TOTAL_MS", "MAX_MS");
++    fprintf(fp, "------------------------------------------------\n");
++
++    int k = (top_k < n_rows) ? top_k : n_rows;
++    for (int i = 0; i < k; i++) {
++        int idx = rows[i].op_idx;
++        const char * name = ggml_op_name((enum ggml_op)idx);
++        if (!name) name = "UNKNOWN";
++        fprintf(fp, "%-16s %8" PRIu64 " %12.3f %12.3f\n",
++                name, p->count[idx],
++                (double)p->total_ns[idx] / 1e6,
++                (double)p->max_ns[idx] / 1e6);
++    }
++}
+diff --git a/docs/profiling.md b/docs/profiling.md
+new file mode 100644
+index 0000000..3a529e2
+--- /dev/null
++++ b/docs/profiling.md
+@@ -0,0 +1,131 @@
++# GGML Graph Profiler
++
++The GGML graph profiler is an **opt-in** facility that records per-operation timing, graph-level totals, and memory estimates during `ggml_graph_compute`. When disabled, it adds zero overhead.
++
++## Enabling the Profiler
++
++1. Create a profiler: `ggml_profiler_t * p = ggml_profiler_new();`
++2. Build your compute plan: `struct ggml_cplan plan = ggml_graph_plan(cgraph, n_threads, NULL);`
++3. Attach the profiler: `ggml_cplan_set_profiler(&plan, p);`
++4. Allocate work buffer and run: `ggml_graph_compute(cgraph, &plan);`
++5. Inspect results (see below), then free: `ggml_profiler_free(p);`
++
++## Example
++
++```c
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-profiler.h"
++
++// ... build graph gf ...
++
++ggml_profiler_t * profiler = ggml_profiler_new();
++struct ggml_cplan plan = ggml_graph_plan(gf, n_threads, NULL);
++plan.work_data = (uint8_t *)malloc(plan.work_size);
++ggml_cplan_set_profiler(&plan, profiler);
++
++ggml_graph_compute(gf, &plan);
++
++// Print human-readable table (top 10 ops by time)
++ggml_profiler_dump_table(profiler, stdout, 10);
++
++// Or export JSON for tooling
++ggml_profiler_dump_json(profiler, stdout);
++
++ggml_profiler_free(profiler);
++```
++
++## Output
++
++### Table (ggml_profiler_dump_table)
++
++```
++=== GGML Profiler Summary ===
++Total wall time: 12.345 ms
++Threads: 8 | Nodes executed: 742
++Work buffer: 1048576 B | Backend buffers: 2147483648 B | Peak estimate: 2148532224 B
++
++--- Top 10 ops by time ---
++OP                  COUNT    TOTAL_MS       MAX_MS
++------------------------------------------------
++MUL_MAT                64      80.100        2.900
++RMS_NORM              128       5.200        0.120
++...
++```
++
++### JSON (ggml_profiler_dump_json)
++
++```json
++{
++  "version": 1,
++  "summary": {
++    "wall_ms_total": 12.345,
++    "n_threads": 8,
++    "n_nodes_executed": 742,
++    "work_size_bytes": 1048576,
++    "buffers_size_bytes": 2147483648,
++    "peak_estimate_bytes": 2148532224
++  },
++  "ops": [
++    { "op": "MUL_MAT", "count": 64, "wall_ms_total": 80.1, "wall_ms_max": 2.9 },
++    ...
++  ]
++}
++```
++
++## API Summary
++
++| Function | Description |
++|----------|-------------|
++| `ggml_profiler_new()` | Create a new profiler |
++| `ggml_profiler_free(p)` | Free the profiler |
++| `ggml_profiler_reset(p)` | Reset stats for reuse |
++| `ggml_cplan_set_profiler(cplan, p)` | Attach profiler to compute plan |
++| `ggml_profiler_get_summary(p, summary)` | Fill summary struct |
++| `ggml_profiler_dump_table(p, fp, top_k)` | Print top-k ops table |
++| `ggml_profiler_dump_json(p, fp)` | Export JSON |
++
++## Memory Estimate
++
++The profiler computes an **upper-bound estimate** of peak memory:
++
++- **work_size_bytes**: Size of the temporary work buffer (from `ggml_graph_plan`)
++- **buffers_size_bytes**: Sum of unique backend buffer sizes used by tensors in the graph
++- **peak_estimate_bytes**: work_size + buffers_size
++
++This is a conservative estimate; actual peak may be lower due to buffer reuse.
++
++## Scope
++
++- **CPU backend only**: Profiling is implemented for the CPU graph compute path. GPU backends (CUDA, Metal, Vulkan, etc.) are not instrumented.
++- **Per-op timing**: Recorded only from thread 0 (`ith == 0`) to avoid double-counting; internal barriers ensure correct ordering.
++- **NOPs skipped**: Reshape, transpose, view, permute are not counted as executed nodes.
++
++## Run the Example
++
++```bash
++./bin/simple-profiler
++```
++
++## Benchmark Overhead
++
++To measure profiler overhead (disabled vs enabled):
++
++```bash
++./bin/bench-profiler-overhead [n_elements] [n_iterations]
++```
++
++- **n_elements**: Graph size (default 512). Larger graphs amortize timing overhead.
++- **n_iterations**: Number of runs (default 100).
++
++Example output:
++
++```
++=== Profiler overhead benchmark ===
++Graph: n=512 elements (mul + add), 100 iterations (+ 5 warmup)
++
++Profiler disabled: 1234 us total, 12.340 us/iter (avg)
++Profiler enabled:  1250 us total, 12.500 us/iter (avg)
++
++Overhead: 0.160 us/iter (1.30%)
++```
+diff --git a/examples/simple/CMakeLists.txt b/examples/simple/CMakeLists.txt
+index 7d3aae0..4c728dc 100644
+--- a/examples/simple/CMakeLists.txt
++++ b/examples/simple/CMakeLists.txt
+@@ -5,6 +5,12 @@ set(TEST_TARGET simple-ctx)
+ add_executable(${TEST_TARGET} simple-ctx.cpp)
+ target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+ 
++#
++# simple-profiler
++
++add_executable(simple-profiler simple-profiler.cpp)
++target_link_libraries(simple-profiler PRIVATE ggml)
++
+ #
+ # simple-backend
+ 
+diff --git a/examples/simple/simple-profiler.cpp b/examples/simple/simple-profiler.cpp
+new file mode 100644
+index 0000000..080c88e
+--- /dev/null
++++ b/examples/simple/simple-profiler.cpp
+@@ -0,0 +1,79 @@
++// Simple example demonstrating the GGML graph profiler
++// Build a small graph (mul + add), run with profiling, and print results
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-profiler.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++int main(void) {
++    ggml_time_init();
++
++    // Create context and tensors for: c = a * b + d
++    size_t ctx_size = 256 * 1024;  // 256 KB
++    struct ggml_init_params params = {
++        .mem_size   = ctx_size,
++        .mem_buffer = NULL,
++        .no_alloc   = false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    int n = 128;
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++
++    // Initialize with simple values
++    for (int i = 0; i < n; i++) {
++        ((float *)a->data)[i] = 1.0f / (i + 1);
++        ((float *)b->data)[i] = (float)(i + 1);
++        ((float *)d->data)[i] = 0.1f;
++    }
++
++    // Build graph: c = a * b + d
++    struct ggml_tensor * mul = ggml_mul(ctx, a, b);
++    struct ggml_tensor * c  = ggml_add(ctx, mul, d);
++
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, c);
++
++    // Create profiler and attach to plan
++    ggml_profiler_t * profiler = ggml_profiler_new();
++    struct ggml_cplan plan = ggml_graph_plan(gf, 1, nullptr);
++
++    if (plan.work_size > 0) {
++        plan.work_data = (uint8_t *)malloc(plan.work_size);
++    }
++    ggml_cplan_set_profiler(&plan, profiler);
++
++    // Run computation with profiling
++    ggml_graph_compute(gf, &plan);
++
++    // Print results
++    printf("\n=== Profiler table output (top 10) ===\n");
++    ggml_profiler_dump_table(profiler, stdout, 10);
++
++    printf("\n=== Profiler JSON output ===\n");
++    ggml_profiler_dump_json(profiler, stdout);
++
++    // Summary
++    struct ggml_profiler_summary summary;
++    ggml_profiler_get_summary(profiler, &summary);
++    printf("\n=== Summary ===\n");
++    printf("Total: %.3f ms, %d threads, %d nodes\n",
++           summary.wall_ms_total, summary.n_threads, summary.n_nodes_executed);
++    printf("Peak memory estimate: %zu bytes (%.2f KB)\n",
++           summary.peak_estimate_bytes, summary.peak_estimate_bytes / 1024.0);
++
++    // Cleanup
++    if (plan.work_data) {
++        free(plan.work_data);
++    }
++    ggml_profiler_free(profiler);
++    ggml_free(ctx);
++
++    return 0;
++}
+diff --git a/ggml/tests/CMakeLists.txt b/ggml/tests/CMakeLists.txt
+index 7c28e34..29c0ed9 100644
+--- a/ggml/tests/CMakeLists.txt
++++ b/ggml/tests/CMakeLists.txt
+@@ -263,6 +263,20 @@ if (NOT GGML_BACKEND_DL)
+     target_link_libraries(${TEST_TARGET} PRIVATE ggml)
+     add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
+ 
++    #
++    # test-profiler
++
++    set(TEST_TARGET test-profiler)
++    add_executable(${TEST_TARGET} ${TEST_TARGET}.c)
++    target_link_libraries(${TEST_TARGET} PRIVATE ggml)
++    add_test(NAME ${TEST_TARGET} COMMAND $<TARGET_FILE:${TEST_TARGET}>)
++
++    #
++    # bench-profiler-overhead
++
++    add_executable(bench-profiler-overhead bench-profiler-overhead.c)
++    target_link_libraries(bench-profiler-overhead PRIVATE ggml)
++
+     #
+     # test-dup
+ 
+diff --git a/ggml/tests/bench-profiler-overhead.c b/ggml/tests/bench-profiler-overhead.c
+new file mode 100644
+index 0000000..375966c
+--- /dev/null
++++ b/ggml/tests/bench-profiler-overhead.c
+@@ -0,0 +1,112 @@
++// Benchmark: profiler overhead (disabled vs enabled)
++// Runs the same graph many times with and without profiling to measure overhead.
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-profiler.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <inttypes.h>
++
++#define WARMUP 5
++#define ITERATIONS 100
++#define MIN_ITERATIONS 10
++
++static struct ggml_cgraph * build_graph(struct ggml_context * ctx, int n) {
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++
++    for (int i = 0; i < n; i++) {
++        ((float *)a->data)[i] = 1.0f / (i + 1);
++        ((float *)b->data)[i] = (float)(i + 1);
++        ((float *)d->data)[i] = 0.1f;
++    }
++
++    struct ggml_tensor * mul = ggml_mul(ctx, a, b);
++    struct ggml_tensor * c  = ggml_add(ctx, mul, d);
++
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, c);
++    return gf;
++}
++
++static int64_t run_benchmark(struct ggml_cgraph * gf, struct ggml_cplan * plan,
++                             int n_iter, int warmup) {
++    int64_t total_us = 0;
++    for (int i = 0; i < warmup + n_iter; i++) {
++        int64_t t0 = ggml_time_us();
++        ggml_graph_compute(gf, plan);
++        int64_t t1 = ggml_time_us();
++        if (i >= warmup) {
++            total_us += (t1 - t0);
++        }
++    }
++    return total_us;
++}
++
++int main(int argc, char ** argv) {
++    ggml_time_init();
++
++    int n = 512;
++    int n_iter = ITERATIONS;
++    if (argc >= 2) n = atoi(argv[1]);
++    if (argc >= 3) n_iter = atoi(argv[2]);
++    if (n_iter < MIN_ITERATIONS) n_iter = MIN_ITERATIONS;
++
++    size_t ctx_size = 1024 * 1024;
++    struct ggml_init_params params = {
++        .mem_size   = ctx_size,
++        .mem_buffer = NULL,
++        .no_alloc   = false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    struct ggml_cgraph * gf = build_graph(ctx, n);
++    struct ggml_cplan plan = ggml_graph_plan(gf, 1, NULL);
++    if (plan.work_size > 0) {
++        plan.work_data = (uint8_t *)malloc(plan.work_size);
++    }
++
++    /* Benchmark: profiler disabled */
++    int64_t us_disabled = run_benchmark(gf, &plan, n_iter, WARMUP);
++
++    /* Benchmark: profiler enabled */
++    ggml_profiler_t * profiler = ggml_profiler_new();
++    ggml_cplan_set_profiler(&plan, profiler);
++    int64_t us_enabled = run_benchmark(gf, &plan, n_iter, WARMUP);
++
++    /* Report */
++    double avg_disabled_us = (double)us_disabled / n_iter;
++    double avg_enabled_us  = (double)us_enabled  / n_iter;
++    double overhead_us    = avg_enabled_us - avg_disabled_us;
++    double overhead_pct    = (avg_disabled_us > 0)
++        ? (overhead_us / avg_disabled_us * 100.0) : 0.0;
++
++    printf("=== Profiler overhead benchmark ===\n");
++    printf("Graph: n=%d elements (mul + add), %d iterations (+ %d warmup)\n", n, n_iter, WARMUP);
++    printf("\n");
++    printf("Profiler disabled: %" PRId64 " us total, %.3f us/iter (avg)\n",
++           (int64_t)us_disabled, avg_disabled_us);
++    printf("Profiler enabled:  %" PRId64 " us total, %.3f us/iter (avg)\n",
++           (int64_t)us_enabled, avg_enabled_us);
++    printf("\n");
++    printf("Overhead: %.3f us/iter (%.2f%%)\n", overhead_us, overhead_pct);
++    printf("\n");
++
++    if (overhead_pct < 1.0 && avg_disabled_us > 0) {
++        printf("PASS: Overhead < 1%% when enabled (typical for small graphs)\n");
++    } else if (overhead_us < 1.0) {
++        printf("PASS: Absolute overhead < 1 us/iter\n");
++    } else {
++        printf("NOTE: Overhead %.2f%% - expected for small/fast graphs\n", overhead_pct);
++    }
++
++    ggml_profiler_free(profiler);
++    if (plan.work_data) free(plan.work_data);
++    ggml_free(ctx);
++
++    return 0;
++}
+diff --git a/ggml/tests/test-profiler.c b/ggml/tests/test-profiler.c
+new file mode 100644
+index 0000000..4253267
+--- /dev/null
++++ b/ggml/tests/test-profiler.c
+@@ -0,0 +1,175 @@
++// Simple test for GGML graph profiler
++// Validates: JSON has required keys, stats are non-zero for a toy graph
++
++#include "ggml.h"
++#include "ggml-cpu.h"
++#include "ggml-profiler.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#if defined(_WIN32)
++#include <io.h>
++#define unlink _unlink
++#else
++#include <unistd.h>
++#endif
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++static int test_profiler_basic(void) {
++    ggml_time_init();
++
++    struct ggml_init_params params = {
++        .mem_size   = 256 * 1024,
++        .mem_buffer = NULL,
++        .no_alloc   = false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    int n = 64;
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++    struct ggml_tensor * d = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n);
++
++    for (int i = 0; i < n; i++) {
++        ((float *)a->data)[i] = 1.0f;
++        ((float *)b->data)[i] = 2.0f;
++        ((float *)d->data)[i] = 0.5f;
++    }
++
++    struct ggml_tensor * mul = ggml_mul(ctx, a, b);
++    struct ggml_tensor * c  = ggml_add(ctx, mul, d);
++
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, c);
++
++    ggml_profiler_t * profiler = ggml_profiler_new();
++    if (!profiler) {
++        fprintf(stderr, "ggml_profiler_new failed\n");
++        ggml_free(ctx);
++        return 1;
++    }
++
++    struct ggml_cplan plan = ggml_graph_plan(gf, 1, NULL);
++    if (plan.work_size > 0) {
++        plan.work_data = (uint8_t *)malloc(plan.work_size);
++    }
++    ggml_cplan_set_profiler(&plan, profiler);
++
++    ggml_graph_compute(gf, &plan);
++
++    struct ggml_profiler_summary summary;
++    ggml_profiler_get_summary(profiler, &summary);
++
++    if (summary.n_nodes_executed == 0) {
++        fprintf(stderr, "expected n_nodes_executed > 0\n");
++        if (plan.work_data) free(plan.work_data);
++        ggml_profiler_free(profiler);
++        ggml_free(ctx);
++        return 1;
++    }
++
++    if (summary.wall_ms_total < 0) {
++        fprintf(stderr, "expected wall_ms_total >= 0\n");
++        if (plan.work_data) free(plan.work_data);
++        ggml_profiler_free(profiler);
++        ggml_free(ctx);
++        return 1;
++    }
++
++    if (plan.work_data) free(plan.work_data);
++    ggml_profiler_free(profiler);
++    ggml_free(ctx);
++    return 0;
++}
++
++static int test_profiler_json_keys(void) {
++    ggml_time_init();
++
++    struct ggml_init_params params = {
++        .mem_size   = 256 * 1024,
++        .mem_buffer = NULL,
++        .no_alloc   = false,
++    };
++    struct ggml_context * ctx = ggml_init(params);
++
++    struct ggml_tensor * a = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 8);
++    struct ggml_tensor * b = ggml_add(ctx, a, a);
++    struct ggml_cgraph * gf = ggml_new_graph(ctx);
++    ggml_build_forward_expand(gf, b);
++
++    ggml_profiler_t * profiler = ggml_profiler_new();
++    struct ggml_cplan plan = ggml_graph_plan(gf, 1, NULL);
++    if (plan.work_size > 0) plan.work_data = (uint8_t *)malloc(plan.work_size);
++    ggml_cplan_set_profiler(&plan, profiler);
++
++    ggml_graph_compute(gf, &plan);
++
++    const char * path = "test-profiler-out.json";
++    FILE * fp = fopen(path, "w");
++    if (!fp) {
++        if (plan.work_data) free(plan.work_data);
++        ggml_profiler_free(profiler);
++        ggml_free(ctx);
++        return 1;
++    }
++    ggml_profiler_dump_json(profiler, fp);
++    fclose(fp);
++
++    fp = fopen(path, "r");
++    if (!fp) {
++        unlink(path);
++        if (plan.work_data) free(plan.work_data);
++        ggml_profiler_free(profiler);
++        ggml_free(ctx);
++        return 1;
++    }
++    char buf[4096];
++    size_t n = fread(buf, 1, sizeof(buf) - 1, fp);
++    buf[n] = '\0';
++    fclose(fp);
++    unlink(path);
++
++    int ok = 1;
++    if (strstr(buf, "\"version\"") == NULL) ok = 0;
++    if (strstr(buf, "\"summary\"") == NULL) ok = 0;
++    if (strstr(buf, "\"wall_ms_total\"") == NULL) ok = 0;
++    if (strstr(buf, "\"n_threads\"") == NULL) ok = 0;
++    if (strstr(buf, "\"n_nodes_executed\"") == NULL) ok = 0;
++    if (strstr(buf, "\"ops\"") == NULL) ok = 0;
++
++    if (plan.work_data) free(plan.work_data);
++    ggml_profiler_free(profiler);
++    ggml_free(ctx);
++
++    if (!ok) {
++        fprintf(stderr, "JSON missing required keys. Output:\n%s\n", buf);
++        return 1;
++    }
++    return 0;
++}
++
++int main(int argc, char ** argv) {
++    (void)argc;
++    (void)argv;
++
++    if (test_profiler_basic() != 0) {
++        fprintf(stderr, "test_profiler_basic failed\n");
++        return 1;
++    }
++
++    if (test_profiler_json_keys() != 0) {
++        fprintf(stderr, "test_profiler_json_keys failed\n");
++        return 1;
++    }
++
++    printf("test-profiler: OK\n");
++    return 0;
++}
++
++#ifdef __cplusplus
++}
++#endif
